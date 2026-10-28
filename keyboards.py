@@ -3,7 +3,6 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from answers import texts
-from databases import get_language
 
 def language_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[

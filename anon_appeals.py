@@ -1,49 +1,18 @@
-import asyncio
+import os
 import logging
-import sqlite3
 
-from pathlib import Path
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from answers import texts
-from databases import *
+from databases import get_language, save_link, get_link
 from keyboards import back_keyboard_menu, back_keyboard_info
 
-ADMIN_CHAT_ID = -5571000368
-PROJECT_DIR = Path(__file__).resolve().parent
-DB_PATH = PROJECT_DIR / "bot.db"
-
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "-5571000368"))
 router = Router()
 log = logging.getLogger(__name__)
-
-
-def _save_link_appeal(admin_message_id: int, user_id: int, user_message_id: int, status: str = "anon"):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO support_messages "
-            "(admin_message_id, user_id, user_message_id, status) VALUES (?, ?, ?, ?)",
-            (admin_message_id, user_id, user_message_id, status),
-        )
-
-
-def _get_link_sync(admin_message_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT user_id, user_message_id FROM support_messages "
-            "WHERE admin_message_id = ?",
-            (admin_message_id,),
-        ).fetchone()
-
-
-async def save_link(admin_message_id: int, user_id: int, user_message_id: int, status: str = "anon"):
-    await asyncio.to_thread(_save_link_appeal, admin_message_id, user_id, user_message_id, status)
-
-
-async def get_link(admin_message_id: int):
-    return await asyncio.to_thread(_get_link_sync, admin_message_id)
 
 
 # ---------- общая логика отправки обращения в админ-чат ----------
@@ -82,7 +51,7 @@ class SupportState(StatesGroup):
 
 @router.callback_query(F.data == SUPPORT_CALLBACK_DATA)
 async def support_button(callback: CallbackQuery, state: FSMContext):
-    lang = get_language(callback.from_user.id)
+    lang = await get_language(callback.from_user.id)
     await state.set_state(SupportState.waiting_message)
     await callback.message.edit_text(texts[lang]["appeal_anon"], reply_markup=back_keyboard_menu(lang))
     await callback.answer()
@@ -93,7 +62,7 @@ async def user_message(message: Message, bot: Bot, state: FSMContext):
     caption = "📩 Новое анонимное обращение!"
     if await relay_to_admin(message, bot, caption, status="anon"):
         await state.clear()
-        await message.answer(texts[get_language(message.from_user.id)]["appeal_send"])
+        await message.answer(texts[await get_language(message.from_user.id)]["appeal_send"])
 
 NAMED_CALLBACK_DATA = "appeal:not_anon"
 
@@ -104,7 +73,7 @@ class NamedState(StatesGroup):
 
 @router.callback_query(F.data == NAMED_CALLBACK_DATA)
 async def named_button(callback: CallbackQuery, state: FSMContext):
-    lang = get_language(callback.from_user.id)
+    lang = await get_language(callback.from_user.id)
     await state.set_state(NamedState.waiting_message)
     await callback.message.edit_text(texts[lang]["appeal_not_anon"], reply_markup=back_keyboard_info(lang))
     await callback.answer()
@@ -120,7 +89,7 @@ async def named_message(message: Message, bot: Bot, state: FSMContext):
 
     if await relay_to_admin(message, bot, caption, status="named"):
         await state.clear()
-        await message.answer(texts[get_language(user.id)]["appeal_send"])
+        await message.answer(texts[await get_language(user.id)]["appeal_send"])
 
 @router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def admin_reply(message: Message, bot: Bot):
