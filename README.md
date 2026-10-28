@@ -41,7 +41,7 @@
    ```bash
    python3 -m venv .venv
    .venv/bin/pip install -r requirements.txt
-   cp .env.example .env
+   test -e .env || cp .env.example .env
    ```
 
 4. В локальном `.env` заполни `DATABASE_URL` адресом Neon. Затем:
@@ -143,7 +143,7 @@ compute. Пинги UptimeRobot также потребляют ресурсы R
 
 ## Разработка и тесты
 
-Нужны Python 3.12 и PostgreSQL 17. Секреты храни в локальном `.env`.
+Нужен Python 3.9 или новее (рекомендуется 3.12) и PostgreSQL 17. Секреты храни в локальном `.env`.
 Для разработки используй отдельного Telegram-бота: polling при запуске удаляет
 webhook для своего токена, сохраняя pending updates.
 
@@ -183,3 +183,30 @@ BOT_MODE=register-webhook WEBHOOK_BASE_URL=https://YOUR-SERVICE.onrender.com \
 
 Секреты и базу не включай в Git. Настрой резервные копии/восстановление согласно
 тарифу Neon; ни Render, ни UptimeRobot не заменяют backup пользовательских данных.
+
+## Если pip не находит версию пакета
+
+Сначала проверь версию Python внутри виртуального окружения:
+
+```bash
+python3 --version
+.venv/bin/python --version
+```
+
+Для этого кода нужен Python 3.9 или новее. На Render Dockerfile выбирает 3.12.
+После получения актуальной ветки обнови зависимости:
+
+```bash
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Если Python старее 3.9, установи Python 3.12 и создай новое окружение,
+сохранив старое и файл `.env`:
+
+```bash
+python3.12 -m venv .venv312
+.venv312/bin/python -m pip install -r requirements.txt
+```
+
+В таком случае для дальнейших локальных команд используй `.venv312/bin/python`.

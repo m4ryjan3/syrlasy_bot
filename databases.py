@@ -1,4 +1,5 @@
 """Shared PostgreSQL storage. Connections are initialized by application startup."""
+from __future__ import annotations
 import json
 import os
 import ssl
