@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: syrlasy-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: codex/neon-render-webhook
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /livez
+    numInstances: 1
+    envVars:
+      - key: BOT_MODE
+        value: webhook
+      - key: AUTO_REGISTER_WEBHOOK
+        value: "true"
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: ADMIN_CHAT_ID
+        value: "-5571000368"

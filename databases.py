@@ -1,6 +1,8 @@
 """Shared PostgreSQL storage. Connections are initialized by application startup."""
 import json
 import os
+import ssl
+from urllib.parse import urlsplit
 
 import asyncpg
 from aiogram.fsm.state import State
@@ -22,7 +24,14 @@ async def init_db():
     dsn = os.environ.get('DATABASE_URL')
     if not dsn:
         raise RuntimeError('DATABASE_URL is required')
-    candidate = await asyncpg.create_pool(dsn, min_size=1, max_size=5, command_timeout=30)
+    # Neon uses public CA certificates. Pass an explicit verifying context because
+    # asyncpg's libpq-style verify-full otherwise expects ~/.postgresql/root.crt.
+    host = urlsplit(dsn).hostname or ''
+    tls = {'ssl': ssl.create_default_context()} if host.endswith('.neon.tech') else {}
+    candidate = await asyncpg.create_pool(
+        dsn, min_size=0, max_size=3, command_timeout=30,
+        max_inactive_connection_lifetime=60, statement_cache_size=0, **tls,
+    )
     try:
         async with candidate.acquire() as conn:
             async with conn.transaction():
@@ -83,7 +92,7 @@ async def get_link(admin_message_id: int):
 
 
 class PostgresStorage(BaseStorage):
-    """Persist aiogram conversation state across Cloud Run restarts."""
+    """Persist aiogram conversation state across service restarts."""
     def __init__(self):
         self.key_builder = DefaultKeyBuilder(
             with_bot_id=True, with_business_connection_id=True, with_destiny=True

@@ -5,6 +5,7 @@ import re
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ def create_bot() -> Bot:
 
 
 def create_dispatcher() -> Dispatcher:
-    dp = Dispatcher(storage=PostgresStorage())
+    dp = Dispatcher(storage=PostgresStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router_handler)
     dp.include_router(router_anon)
     return dp
@@ -39,7 +40,7 @@ def webhook_secret() -> str:
 
 
 def webhook_settings() -> tuple[str, str]:
-    url = os.environ.get('WEBHOOK_BASE_URL', '').rstrip('/')
+    url = (os.environ.get('WEBHOOK_BASE_URL') or os.environ.get('RENDER_EXTERNAL_URL', '')).rstrip('/')
     if not url.startswith('https://'):
         raise RuntimeError('WEBHOOK_BASE_URL must be the public HTTPS service URL')
     return url + '/webhook', webhook_secret()
@@ -58,6 +59,9 @@ async def create_app() -> web.Application:
         finally:
             await close_db()
 
+    async def live(request):
+        return web.json_response({'status': 'ok'})
+
     async def health(request):
         try:
             await pool().fetchval('SELECT 1')
@@ -66,10 +70,15 @@ async def create_app() -> web.Application:
         return web.json_response({'status': 'ok'})
 
     app.cleanup_ctx.append(database_lifespan)
+    app.router.add_get('/livez', live)
     app.router.add_get('/healthz', health)
     SimpleRequestHandler(
         dispatcher=dp, bot=bot, secret_token=secret, handle_in_background=False
     ).register(app, path='/webhook')
+    if os.environ.get('AUTO_REGISTER_WEBHOOK', 'false').lower() == 'true':
+        async def on_startup():
+            await configure_webhook(bot, dp)
+        dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
     return app
 
@@ -86,18 +95,22 @@ async def polling():
         await close_db()
 
 
-async def register_webhook():
+async def configure_webhook(bot: Bot, dp: Dispatcher):
     url, secret = webhook_settings()
+    await bot.set_webhook(
+        url=url, secret_token=secret, allowed_updates=dp.resolve_used_update_types(),
+        max_connections=1, drop_pending_updates=False,
+    )
+    info = await bot.get_webhook_info()
+    if info.url != url:
+        raise RuntimeError('Telegram did not retain the requested webhook URL')
+    logging.getLogger(__name__).info('Webhook registered; pending updates: %d', info.pending_update_count)
+
+
+async def register_webhook():
     bot = create_bot()
     try:
-        await bot.set_webhook(
-            url=url, secret_token=secret, allowed_updates=create_dispatcher().resolve_used_update_types(),
-            max_connections=1, drop_pending_updates=False,
-        )
-        info = await bot.get_webhook_info()
-        if info.url != url:
-            raise RuntimeError('Telegram did not retain the requested webhook URL')
-        print('Webhook registered; pending updates:', info.pending_update_count)
+        await configure_webhook(bot, create_dispatcher())
     finally:
         await bot.session.close()
 

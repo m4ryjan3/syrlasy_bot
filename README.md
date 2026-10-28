@@ -1,183 +1,185 @@
-# Syrlasy bot: Cloud Run + PostgreSQL
+# Syrlasy: Neon + Render + UptimeRobot
 
-Команды, тексты, кнопки и пересылка обращений сохранены. Язык пользователя,
-связи сообщений с админ-чатом и FSM (ожидание обращения) хранятся в PostgreSQL.
-SQLite в рабочем приложении больше не используется. Схема создаётся при старте;
-старый `bot.db` оставлен для переноса данных и исключён из Docker/Cloud Build.
+Бот работает через Telegram webhook на Render. В PostgreSQL Neon сохраняются
+языки пользователей, связи обращений с админ-чатом и состояние диалогов (FSM).
+Команды, тексты и кнопки сохранены. SQLite нужен только для переноса старых данных;
+`bot.db` и `.env` не попадают в Docker-образ.
 
-## Локальный запуск
+## 1. Создай базу в Neon
 
-Нужны Python 3.12 и PostgreSQL 17. Из корня репозитория:
+1. Зарегистрируйся на [neon.tech](https://neon.tech/) и создай проект PostgreSQL.
+   Выбери регион рядом с Render, например Frankfurt. Проверь лимиты выбранного плана.
+2. В **Connect** выбери базу и пользователя. Для одного экземпляра бота достаточно
+   прямого подключения: отключи **Connection pooling**.
+3. Сохрани URL подключения в менеджере паролей. Формат для этого бота:
+
+   ```text
+   postgresql://USER:PASSWORD@ep-YOUR-ENDPOINT.REGION.aws.neon.tech/neondb?sslmode=verify-full
+   ```
+
+   Используй свой host, database, user и password из Neon; не копируй пример буквально.
+   `sslmode=verify-full` проверяет сертификат и имя сервера. Сохрани URL-экранирование
+   спецсимволов пароля. Для asyncpg нужен URL без libpq-опций вроде `channel_binding`:
+   этот драйвер их не поддерживает. Если политика твоей базы требует именно channel
+   binding, текущий драйвер для такой политики не подходит — не отключай требование.
+4. Полный URL содержит пароль: вводи его только в Render Environment или локальный
+   `.env`, не в Git и не в чат.
+
+Приложение само создаёт таблицы. Пул небольшой (до 3 соединений); неиспользуемые
+соединения закрываются через 60 секунд. Prepared statement cache отключён для
+совместимости с transaction pooler, если позже понадобится pooled endpoint.
+
+## 2. Подготовь данные перед переключением
+
+Если у старого бота есть данные:
+
+1. Скачай актуальный `bot.db` со старого сервера и сделай резервную копию. Файл в
+   репозитории может быть устаревшим.
+2. Останови старого бота, чтобы новые изменения не потерялись во время переноса.
+3. На компьютере из корня проекта:
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   cp .env.example .env
+   ```
+
+4. В локальном `.env` заполни `DATABASE_URL` адресом Neon. Затем:
+
+   ```bash
+   .venv/bin/python scripts/migrate_sqlite.py /path/to/current/bot.db
+   ```
+
+Скрипт читает SQLite только для чтения, переносит языки и связи обращений одной
+транзакцией. Повторный запуск не перезаписывает уже существующие строки. Старое
+состояние ожидания сообщения было в памяти, перенести его нельзя. Если данных нет,
+миграцию можно пропустить. Polling со старым токеном нужно остановить в любом случае
+перед включением нового webhook.
+
+## 3. Разверни Web Service на Render
+
+Используй ветку **`codex/neon-render-webhook`** репозитория `m4ryjan3/syrlasy_bot`.
+Подключи GitHub к [Render](https://dashboard.render.com/).
+
+Самый простой способ — **New → Blueprint**, выбрать репозиторий и эту ветку.
+В ней есть `render.yaml`: один Docker Web Service в Frankfurt, план Free.
+Blueprint запросит `BOT_TOKEN` и `DATABASE_URL`; `WEBHOOK_SECRET` сгенерирует сам.
+Перед подтверждением проверь выбранный план и актуальные ограничения Render.
+
+Или создай **New → Web Service** вручную:
+
+| Настройка | Значение |
+| --- | --- |
+| Repository | `m4ryjan3/syrlasy_bot` |
+| Branch | `codex/neon-render-webhook` |
+| Language / Runtime | Docker |
+| Dockerfile Path | `./Dockerfile` |
+| Region | Frankfurt или ближайший к Neon |
+| Instances | 1 |
+| Health Check Path | `/livez` |
+
+Для Docker отдельно задавать Build Command и Start Command не нужно: их определяет
+Dockerfile. Сервис слушает `0.0.0.0:$PORT`; Render задаёт `PORT` автоматически.
+Добавь переменные в **Environment**:
+
+| Переменная | Что указать |
+| --- | --- |
+| `BOT_TOKEN` | Токен бота от BotFather |
+| `DATABASE_URL` | Свой Neon URL из шага 1 |
+| `BOT_MODE` | `webhook` |
+| `AUTO_REGISTER_WEBHOOK` | `true` после переноса базы и остановки старого бота |
+| `WEBHOOK_SECRET` | Независимая случайная строка; Blueprint генерирует её автоматически |
+| `ADMIN_CHAT_ID` | ID админ-чата; исходное значение `-5571000368` |
+
+При ручной настройке сгенерировать webhook secret на своём компьютере можно так:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+Этот секрет отличается от токена BotFather. Бот должен быть добавлен в админ-чат
+и иметь право копировать туда сообщения.
+
+Render автоматически предоставляет `RENDER_EXTERNAL_URL`. При
+`AUTO_REGISTER_WEBHOOK=true` приложение регистрирует этот адрес + `/webhook`
+в Telegram и проверяет сохранённый URL через `getWebhookInfo`. Никаких токенов
+в адресной строке браузера и запросов `setWebhook` вручную не требуется.
+Pending updates при регистрации сохраняются. Ошибка регистрации приводит к
+ошибке запуска: смотри причину в Render Logs, не публикуя содержимое секретов.
+
+Для своего домена можно задать `WEBHOOK_BASE_URL=https://bot.example.com`; он
+имеет приоритет над адресом Render. При `AUTO_REGISTER_WEBHOOK=false` приложение
+не меняет Telegram webhook; это удобно для подготовки сервиса до переключения.
+
+После Deploy проверь:
+
+- `https://YOUR-SERVICE.onrender.com/livez` → `{"status":"ok"}`: HTTP-процесс отвечает.
+- `https://YOUR-SERVICE.onrender.com/healthz` → `{"status":"ok"}`: Neon отвечает.
+- В Render Logs есть `Webhook registered`.
+- В Telegram: `/start`, оба языка, меню, анонимное/именное обращение, ответ из
+  админ-чата и `/change_language`. Это обязательная проверка с настоящим Telegram.
+
+Обработчики выполняются до HTTP-ответа; POST `/webhook` проверяет заголовок
+`X-Telegram-Bot-Api-Secret-Token`. Без правильного секрета ответ — 401.
+
+## 4. Настрой UptimeRobot
+
+В [UptimeRobot](https://uptimerobot.com/) создай монитор **HTTP(s)**:
+
+- URL: `https://YOUR-SERVICE.onrender.com/livez`.
+- Интервал: 5 минут, если доступен на выбранном плане.
+- Ожидаемый код: 200. Включи доступный канал уведомлений.
+
+Проверка `/livez` не делает SQL-запросов. Это монитор HTTP-сервиса, а не проверка
+доставки сообщений или работоспособности базы. Для проверки БД есть `/healthz`;
+постоянные запросы к нему могут мешать Neon переходить в idle и расходовать лимит
+compute. Пинги UptimeRobot также потребляют ресурсы Render.
+
+Бесплатные планы не дают гарантии непрерывной работы: возможны холодные старты,
+приостановки, исчерпание квот и задержки первого сообщения. UptimeRobot не отменяет
+лимиты Render и Neon и не заменяет проверку бота. Для строгого требования 24/7
+выбери тарифы без нужных тебе ограничений. Настрой уведомления и проверяй актуальные
+условия провайдеров.
+
+## Разработка и тесты
+
+Нужны Python 3.12 и PostgreSQL 17. Секреты храни в локальном `.env`.
+Для разработки используй отдельного Telegram-бота: polling при запуске удаляет
+webhook для своего токена, сохраняя pending updates.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-cp .env.example .env
-```
-
-Заполни `.env` локально: `BOT_TOKEN` и `DATABASE_URL`. Не коммить этот файл.
-Для отдельной локальной базы можно использовать Docker:
-
-```bash
-docker run -d --name syrlasy-postgres \
-  -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=syrlasy \
-  -p 127.0.0.1:5432:5432 -v syrlasy-pgdata:/var/lib/postgresql/data postgres:17
-```
-
-Это **только локальная разработка**: доверительная аутентификация на loopback.
-URL: `postgresql://postgres@127.0.0.1:5432/syrlasy`.
-В облаке нужна отдельная база с паролем и резервными копиями.
-
-```bash
 BOT_MODE=polling .venv/bin/python main.py
 ```
 
-Polling удаляет webhook, сохраняя ожидающие updates. Не запускай его одновременно
-с облачным ботом на том же токене. Для разработки лучше отдельный бот BotFather.
-`ADMIN_CHAT_ID` необязателен; по умолчанию сохранён исходный `-5571000368`.
-Бот должен иметь доступ к этому чату.
-
-Тесты требуют **отдельную одноразовую** БД: они очищают таблицы `users`,
-`support_messages`, `fsm_state`. Telegram в тестах имитируется, запросов к нему нет.
+Для одноразовых локальных тестов:
 
 ```bash
-TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/syrlasy_test \
+docker run -d --name syrlasy-test-db \
+  -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=syrlasy_test \
+  -p 127.0.0.1:55432:5432 postgres:17
+TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/syrlasy_test \
   .venv/bin/python -m pytest -q
 ```
 
-## Google Cloud: первый запуск
+Trust-аутентификация предназначена только для локальных тестов на loopback.
+Тесты очищают таблицы в `TEST_DATABASE_URL`: никогда не указывай рабочую Neon DB.
+Telegram имитируется, реальные сообщения не отправляются.
 
-Понадобятся Google Cloud project, подключённый billing и `gcloud` с доступом к
-проекту. Cloud SQL оплачивается и при отсутствии запросов к боту. Пример ниже —
-однозонный небольшой экземпляр с ежедневным backup и PITR; это не HA-конфигурация.
-Перед созданием проверь актуальные тарифы и подходящий регион.
-
-Выполняй из корня репозитория. Подставь свой project ID:
+Если нужна отдельная регистрация без автоматического режима:
 
 ```bash
-export PROJECT_ID=your-project-id
-export REGION=europe-west1
-export SERVICE=syrlasy-bot
-export INSTANCE=syrlasy-db
-export CONNECTION_NAME="$PROJECT_ID:$REGION:$INSTANCE"
-export RUNTIME_SA="syrlasy-runtime@$PROJECT_ID.iam.gserviceaccount.com"
-gcloud config set project "$PROJECT_ID"
-gcloud services enable run.googleapis.com sqladmin.googleapis.com \
-  secretmanager.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
-
-gcloud iam service-accounts create syrlasy-runtime
-
-gcloud sql instances create "$INSTANCE" --region="$REGION" \
-  --database-version=POSTGRES_17 --edition=ENTERPRISE --tier=db-custom-1-3840 \
-  --storage-size=10 --storage-auto-increase --backup-start-time=02:00 \
-  --enable-point-in-time-recovery
-
-gcloud sql databases create syrlasy --instance="$INSTANCE"
+BOT_MODE=register-webhook WEBHOOK_BASE_URL=https://YOUR-SERVICE.onrender.com \
+  .venv/bin/python main.py
 ```
 
-В Console → Cloud SQL → Users создай пользователя `syrlasy` с сильным паролем.
-Не добавляй `0.0.0.0/0` в authorized networks: Cloud Run использует управляемое
-соединение Cloud SQL через Unix socket и IAM `Cloud SQL Client`.
+Состояние диалогов переживает перезапуски. Внутри процесса сообщения одного
+диалога сериализуются; сохраняй один экземпляр сервиса. Во время redeploy старый
+и новый процесс могут ненадолго пересечься: это не распределённая очередь и не
+гарантия exactly-once. Повтор Telegram после сетевого сбоя может повторить
+пересылку. Для нескольких экземпляров понадобятся межпроцессная сериализация и
+защита от повторной доставки.
 
-В Secret Manager создай три секрета и добавь версии значений через Console:
-
-| Имя секрета | Значение |
-| --- | --- |
-| `syrlasy-bot-token` | Токен BotFather |
-| `syrlasy-database-url` | `postgresql://syrlasy:PASSWORD@/syrlasy?host=/cloudsql/PROJECT:REGION:INSTANCE` |
-| `syrlasy-webhook-secret` | Независимая случайная строка, например результат `python -c 'import secrets; print(secrets.token_urlsafe(32))'` |
-
-В DATABASE_URL замени PROJECT, REGION, INSTANCE и пароль. Спецсимволы пароля
-должны быть percent-encoded как URL userinfo. WEBHOOK_SECRET — отдельный секрет,
-не токен Telegram. Не вставляй значения секретов в Git или команды деплоя.
-
-Выдай runtime service account доступ только к этим секретам и Cloud SQL:
-
-```bash
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$RUNTIME_SA" --role=roles/cloudsql.client
-for secret_name in syrlasy-bot-token syrlasy-database-url syrlasy-webhook-secret; do
-  gcloud secrets add-iam-policy-binding "$secret_name" \
-    --member="serviceAccount:$RUNTIME_SA" --role=roles/secretmanager.secretAccessor
-done
-```
-
-Собери именно Dockerfile: он не включает базу, `.env` и секреты.
-
-```bash
-gcloud artifacts repositories create syrlasy --repository-format=docker --location="$REGION"
-export IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/syrlasy/bot:v1"
-gcloud builds submit --tag "$IMAGE" .
-gcloud run deploy "$SERVICE" --image="$IMAGE" --region="$REGION" \
-  --service-account="$RUNTIME_SA" --allow-unauthenticated \
-  --add-cloudsql-instances="$CONNECTION_NAME" \
-  --set-env-vars=BOT_MODE=webhook \
-  --set-secrets=BOT_TOKEN=syrlasy-bot-token:1,DATABASE_URL=syrlasy-database-url:1,WEBHOOK_SECRET=syrlasy-webhook-secret:1 \
-  --concurrency=1 --max-instances=1 --min-instances=0 \
-  --memory=512Mi --cpu=1 --timeout=60
-export SERVICE_URL="$(gcloud run services describe "$SERVICE" --region="$REGION" --format='value(status.url)')"
-curl --fail "$SERVICE_URL/healthz"
-```
-
-Если версии секретов отличаются от `1`, укажи существующие номера. Cloud Build
-service account нужны права сборки и записи в Artifact Registry; конкретная
-учётная запись зависит от настроек проекта. При IAM-ошибке выдай недостающее
-право используемому аккаунту, не runtime-боту.
-
-Публичный Cloud Run нужен Telegram; POST `/webhook` защищён проверкой заголовка
-`X-Telegram-Bot-Api-Secret-Token`. Токен бота не находится в URL сервиса.
-`/healthz` возвращает 200, только когда PostgreSQL отвечает.
-
-После успешного запуска **отдельно зарегистрируй webhook**. На своём компьютере
-в `.env` должны быть тот же `BOT_TOKEN` и `WEBHOOK_SECRET`, что в Secret Manager:
-
-```bash
-BOT_MODE=register-webhook WEBHOOK_BASE_URL="$SERVICE_URL" .venv/bin/python main.py
-```
-
-Команда вызывает `setWebhook` и проверяет сохранённый URL через `getWebhookInfo`.
-Она не отправляет сообщения пользователям и не удаляет pending updates.
-После этого отправь `/start`, выбери язык, проверь меню, анонимное/именное
-обращение и ответ из админ-чата. Эти проверки с реальным Telegram обязательны
-перед использованием; локальные тесты их не заменяют.
-
-### Перенос старой базы
-
-Останови старый polling и не регистрируй новый webhook до завершения переноса.
-Сделай резервную копию актуального `bot.db` со старого сервера. Файл из Git может
-быть устаревшим. Для подключения к Cloud SQL с компьютера используй официальный
-[Cloud SQL Auth Proxy](https://cloud.google.com/sql/docs/postgres/connect-auth-proxy)
-с учётной записью, имеющей `Cloud SQL Client`:
-
-```bash
-cloud-sql-proxy --address 127.0.0.1 --port 5433 "$CONNECTION_NAME"
-```
-
-В другом терминале установи в локальном `.env` PostgreSQL URL для
-`127.0.0.1:5433` с тем же пользователем и паролем (без параметра socket `host`), затем:
-
-```bash
-.venv/bin/python scripts/migrate_sqlite.py /path/to/current/bot.db
-```
-
-Переносятся языки и связи обращений. Скрипт читает SQLite только для чтения и
-вносит данные в PostgreSQL одной транзакцией. Повторный запуск не перезаписывает
-существующие строки. Старое состояние ожидания сообщения было в памяти и
-перенести его невозможно. После переноса зарегистрируй webhook.
-
-### Эксплуатация
-
-- Не увеличивай concurrency, max instances и `setWebhook.max_connections` без
-  добавления межпроцессной сериализации диалогов. При релизе избегай параллельной
-  обработки старой и новой ревизиями. Состояние хранится постоянно, но это не
-  распределённая очередь и не гарантия exactly-once: повтор Telegram после
-  сетевого сбоя может повторить пересылку.
-- Updates обрабатываются до HTTP-ответа, без фоновых задач после ответа, что
-  совместимо с выделением CPU Cloud Run только на время запроса.
-- Холодный старт при min instances=0 возможен; для меньшей задержки можно поставить
-  min instances=1, учитывая стоимость. Не используй HTTP liveness probe, зависящий
-  от доступности БД, чтобы не перезапускать сервис при временном сбое PostgreSQL.
-- Backup/PITR не заменяют проверку восстановления. Настрой budget alerts,
-  мониторинг ошибок Cloud Run, Cloud SQL и `getWebhookInfo.last_error_message`.
-- Сервис сам webhook при старте не меняет. При изменении URL или webhook secret
-  повтори регистрацию. При ротации версий секретов обнови конфигурацию сервиса.
+Секреты и базу не включай в Git. Настрой резервные копии/восстановление согласно
+тарифу Neon; ни Render, ни UptimeRobot не заменяют backup пользовательских данных.

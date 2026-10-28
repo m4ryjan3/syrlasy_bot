@@ -8,8 +8,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.methods import AnswerCallbackQuery, CopyMessage, EditMessageText, SendMessage
-from aiogram.types import Message, MessageId
+from aiogram.methods import AnswerCallbackQuery, CopyMessage, EditMessageText, SendMessage, SetWebhook, GetWebhookInfo
+from aiogram.types import Message, MessageId, WebhookInfo
 
 import databases as db
 
@@ -78,6 +78,7 @@ class OfflineSession(BaseSession):
         super().__init__()
         self.calls = []
         self.closed = False
+        self.webhook_url = None
 
     async def close(self):
         self.closed = True
@@ -88,6 +89,13 @@ class OfflineSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        if isinstance(method, SetWebhook):
+            assert method.max_connections == 1
+            assert method.drop_pending_updates is False
+            self.webhook_url = method.url
+            return True
+        if isinstance(method, GetWebhookInfo):
+            return WebhookInfo(url=self.webhook_url, has_custom_certificate=False, pending_update_count=0)
         if isinstance(method, AnswerCallbackQuery):
             return True
         if isinstance(method, CopyMessage):
@@ -107,6 +115,8 @@ async def test_webhook_and_existing_bot_flows(database, monkeypatch):
     monkeypatch.setattr(main, 'create_bot', lambda: bot)
     monkeypatch.delenv('WEBHOOK_BASE_URL', raising=False)
     monkeypatch.setenv('WEBHOOK_SECRET', 'test-secret')
+    monkeypatch.setenv('RENDER_EXTERNAL_URL', 'https://syrlasy-test.onrender.com')
+    monkeypatch.setenv('AUTO_REGISTER_WEBHOOK', 'true')
     app = await main.create_app()
     user = {'id': 12345, 'is_bot': False, 'first_name': 'Test'}
     seq = 0
@@ -122,7 +132,12 @@ async def test_webhook_and_existing_bot_flows(database, monkeypatch):
         assert (await client.get('/healthz')).status == 200
         for headers in ({}, {'X-Telegram-Bot-Api-Secret-Token': 'wrong'}):
             assert (await client.post('/webhook', json={'update_id': 1}, headers=headers)).status == 401
-        assert not session.calls
+        assert len(session.calls) == 2
+        assert isinstance(session.calls[0], SetWebhook)
+        assert session.calls[0].url == 'https://syrlasy-test.onrender.com/webhook'
+        assert session.calls[0].secret_token == 'test-secret'
+        assert set(session.calls[0].allowed_updates) == {'message', 'callback_query'}
+        assert (await client.get('/livez')).status == 200
 
         async def update(body):
             nonlocal seq
@@ -169,4 +184,5 @@ async def test_webhook_and_existing_bot_flows(database, monkeypatch):
             raise RuntimeError('database unavailable')
         monkeypatch.setattr(main, 'pool', unavailable)
         assert (await client.get('/healthz')).status == 503
+        assert (await client.get('/livez')).status == 200
     assert session.closed
